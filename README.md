@@ -3,6 +3,8 @@
 `merge-kdbx` merges several KeePass databases (`.kdbx`) into one new database without losing
 any password. The folder structure is kept, and nothing is ever overwritten.
 
+Co-authored: Claude Code
+
 ## How it merges
 
 - The first input file is copied 1:1 into the output. Each following file is merged into it,
