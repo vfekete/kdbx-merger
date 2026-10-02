@@ -345,9 +345,28 @@ class TestFullMerge(MergeTestCase):
 
 
 class TestEdgeCases(MergeTestCase):
-    def test_same_file_twice_gets_new_uuids(self):
+    def test_identical_copy_adds_only_notes(self):
         copy_path = self.tmp / "copy.kdbx"
         shutil.copy(self.f1, copy_path)
+        self.run_merge("-i", "file1.kdbx", "copy.kdbx", "-o", self.out, "-p", PW_OUT,
+                       stdin=f"{PW_A}\n")
+        kp = PyKeePass(str(self.out), password=PW_OUT)
+        orig = PyKeePass(str(self.f1), password=PW_A)
+        self.assertEqual(len(kp.entries), len(orig.entries))
+        for e in kp.entries:
+            self.assertTrue(e.notes.endswith("also in: copy.kdbx"), (e.title, e.notes))
+        item = entry(group_path(kp, "Folder1/Folder2"), "item")
+        self.assertEqual(item.notes, "original item\nalso in: copy.kdbx")
+        self.assertEqual(len(item.history), 1)               # nothing added twice
+        self.assertEqual(len(item.attachments), 1)
+
+    def test_changed_copy_gets_new_uuids(self):
+        copy_path = self.tmp / "copy.kdbx"
+        shutil.copy(self.f1, copy_path)
+        changed = PyKeePass(str(copy_path), password=PW_A)
+        for e in changed.entries:
+            e.password = e.password + "-changed"
+        changed.save()
         self.run_merge("-i", "file1.kdbx", "copy.kdbx", "-o", self.out, "-p", PW_OUT,
                        stdin=f"{PW_A}\n")
         kp = PyKeePass(str(self.out), password=PW_OUT)
@@ -357,6 +376,7 @@ class TestEdgeCases(MergeTestCase):
         f2 = group_path(kp, "Folder1/Folder2")
         self.assertEqual(entry_titles(f2), ["item", "item - 1"])
         dup = entry(f2, "item - 1")
+        self.assertEqual(dup.password, "pw-item-file1-new-changed")
         self.assertEqual(dup.notes, "original item\nsource: copy.kdbx\n"
                                     'same attachment "f1.bin" found in: file1.kdbx, copy.kdbx')
         self.assertEqual(len(dup.history), 1)
@@ -833,6 +853,112 @@ class TestWildcards(MergeTestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("at least two input files are required, found 1",
                       proc.stderr.decode())
+
+class TestSameItems(MergeTestCase):
+    """Items with the same path, title and password are kept once; the other
+    copies are recorded in Notes together with their differences."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.tmp / "same-a.kdbx"
+        kp = create_database(str(self.a), password=PW_A)
+        g = kp.add_group(kp.root_group, "Služby")
+        e = kp.add_entry(g, "Účet 账户", "u1", "same-pw", url="https://one.example",
+                         notes="N1", tags=["a", "b"], expiry_time=EXPIRY_1)
+        e.expires = True
+        e.set_custom_property("plain", "a")
+        e.set_custom_property("pin", "1", protect=True)
+        e.add_attachment(kp.add_binary(b"doc one"), "doc.txt")
+        kp.add_entry(g, "other", "o", "pw-other-a")
+        kp.save()
+
+        self.b = self.tmp / "same-b.kdbx"
+        kp = create_database(str(self.b), password=PW_A)
+        g = kp.add_group(kp.root_group, "Služby")
+        e = kp.add_entry(g, "Účet 账户", "u0", "same-pw", url="https://old.example",
+                         notes="N2\nline2", tags=["x"])
+        e.mtime = datetime(2019, 1, 1, tzinfo=timezone.utc)
+        e.save_history()                                 # one older version
+        e.username = "u2"
+        e.url = "https://two.example"
+        e.set_custom_property("plain", "b")
+        e.set_custom_property("pin", "2", protect=True)
+        e.set_custom_property("only-b", "visible-b")
+        e.add_attachment(kp.add_binary(b"doc two"), "doc.txt")
+        e.add_attachment(kp.add_binary(b"doc one"), "same content.txt")
+        kp.add_entry(g, "other", "o", "pw-other-b")      # same title, other password
+        kp.save()
+
+        self.c = self.tmp / "same-c.kdbx"
+        kp = create_database(str(self.c), password=PW_A)
+        g = kp.add_group(kp.root_group, "Služby")
+        e = kp.add_entry(g, "Účet 账户", "u1", "same-pw", url="https://one.example",
+                         notes="N1", tags=["a", "b"], expiry_time=EXPIRY_1)
+        e.expires = True
+        e.set_custom_property("plain", "a")
+        e.set_custom_property("pin", "1", protect=True)
+        e.add_attachment(kp.add_binary(b"doc one"), "doc.txt")
+        kp.add_entry(g, "other", "o", "pw-other-b")      # same as b's -> "other - 1"
+        kp.add_entry(kp.root_group, "Účet 账户", "u1", "same-pw")   # other path
+        kp.save()
+
+        self.proc = self.run_merge("-i", "same-a.kdbx", "same-b.kdbx", "same-c.kdbx",
+                                   "-o", self.out, "-p", PW_OUT, "-v", stdin=f"{PW_A}\n")
+        self.kp = PyKeePass(str(self.out), password=PW_OUT)
+        self.g = group_path(self.kp, "Služby")
+
+    def test_kept_once_with_differences_in_notes(self):
+        self.assertEqual(entry_titles(self.g), ["other", "other - 1", "Účet 账户"])
+        item = entry(self.g, "Účet 账户")
+        self.assertEqual(item.notes, "\n".join([
+            "N1",
+            "also in: same-b.kdbx, with differences:",
+            "  UserName: u2",
+            "  URL: https://two.example",
+            "  Notes: N2",
+            "    line2",
+            "  Tags: x",
+            "  Expires: never",
+            '  field "plain": b',
+            '  protected field "pin" differs, saved as field "pin (same-b.kdbx)"',
+            '  field "only-b": visible-b',
+            '  attachment "doc.txt" added as "doc.txt (same-b.kdbx)"',
+            "  1 older version(s) added to history",
+            "also in: same-c.kdbx",
+        ]))
+        self.assertIn("same item: Služby/Účet 账户 also in same-b.kdbx",
+                      self.proc.stderr.decode())
+
+    def test_kept_values_unchanged(self):
+        item = entry(self.g, "Účet 账户")
+        self.assertEqual((item.username, item.password, item.url),
+                         ("u1", "same-pw", "https://one.example"))
+        self.assertEqual(item.tags, ["a", "b"])
+        self.assertEqual(item.expiry_time, EXPIRY_1)
+        self.assertEqual(item.get_custom_property("plain"), "a")
+        self.assertEqual(item.get_custom_property("pin"), "1")
+
+    def test_nothing_lost(self):
+        item = entry(self.g, "Účet 账户")
+        self.assertEqual(item.get_custom_property("pin (same-b.kdbx)"), "2")
+        self.assertTrue(item.is_custom_property_protected("pin (same-b.kdbx)"))
+        self.assertEqual(sorted((a.filename, a.data) for a in item.attachments),
+                         [("doc.txt", b"doc one"), ("doc.txt (same-b.kdbx)", b"doc two")])
+        self.assertEqual([(h.username, h.url) for h in item.history],
+                         [("u0", "https://old.example")])
+        self.assertEqual(item.history[0].uuid, item.uuid)
+
+    def test_same_title_other_password_still_indexed(self):
+        other1 = entry(self.g, "other - 1")
+        self.assertEqual(other1.password, "pw-other-b")
+        # file c's identical "other" matches the renamed copy from file b
+        self.assertEqual(other1.notes, "source: same-b.kdbx\nalso in: same-c.kdbx")
+
+    def test_other_path_is_not_the_same_item(self):
+        self.assertEqual(entry(self.kp.root_group, "Účet 账户").username, "u1")
+
+    def test_summary(self):
+        self.assertIn("3 same items noted instead of copied", self.proc.stderr.decode())
 
 
 if __name__ == "__main__":

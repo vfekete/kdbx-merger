@@ -10,8 +10,12 @@ Co-authored: Claude Code
 - The first input file is copied 1:1 into the output. Each following file is merged into it,
   in command line order.
 - Folders with the same path are combined into one, never duplicated.
-- An item whose title already exists in the same folder is added as `title - 1`, `title - 2`,
-  …, with a `source: <file>` line in its notes:
+- An item with the same title **and password** as an item in the same folder is the same
+  item. It is kept only once, with an `also in: <file>` note on the existing item listing what
+  differs (user name, URL, notes, …). Nothing is lost: differing protected fields, different
+  attachments and older versions are moved to the existing item.
+- An item whose title already exists in the same folder but with a different password is
+  added as `title - 1`, `title - 2`, …, with a `source: <file>` line in its notes:
 
   ```
   Folder1/Folder2/
