@@ -1,0 +1,1062 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "pykeepass>=4.1,<5",
+# ]
+# ///
+"""merge-kdbx - join several KeePass (KDBX) databases into one new database.
+
+The first input file is copied 1:1 into the output.  Every following input is
+merged into the result in command line order:
+
+  * groups are matched by name along the whole path; missing groups are created
+  * entries that do not exist yet (same group + same title) are copied as-is
+  * entries whose title already exists in the target group are copied with an
+    indexed title ("item - 1", "item - 2", ...) and get a
+    "source: <input path>" line appended to their notes
+  * identical attachments are stored once; every entry carrying such an
+    attachment gets a note listing all input files it was found in
+
+Nothing is ever overwritten and input files are only ever opened read-only.
+All entry data is copied at XML level, so every property (times, expiry,
+custom fields, attachments, history, icons, tags, auto-type, ...) is kept.
+
+Every input except the first is decrypted in a short-lived child process.
+Its master password, derived keys and decrypted database die with that
+process; the parent only receives the entries that go into the output.
+
+Example:
+    merge-kdbx -i file1.kdbx some/path/file2.kdbx -ip user -o merged.kdbx -p secret
+"""
+
+import argparse
+import base64
+import copy
+import ctypes
+import gc
+import hashlib
+import hmac
+import io
+import os
+import pickle
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import traceback
+import unicodedata
+import uuid
+
+from lxml import etree
+from pykeepass import PyKeePass
+from pykeepass.exceptions import CredentialsError
+from pykeepass.kdbx_parsing import common as kdbx_common
+from pykeepass.kdbx_parsing import kdbx3 as kdbx_v3
+from pykeepass.kdbx_parsing import kdbx4 as kdbx_v4
+
+
+# ---------------------------------------------------------------------------
+# Secret handling
+#
+# Passwords never live in Python `str` objects (immutable, cannot be wiped).
+# They are kept in a `bytearray` wrapped in `Secret`, and every key derived
+# from them that we can reach (composite key, transformed key, master key) is
+# zeroed in place as soon as the corresponding file is no longer needed.
+# ---------------------------------------------------------------------------
+
+_BYTES_DATA_OFFSET = sys.getsizeof(b"") - 1
+_STR_DATA_OFFSET = sys.getsizeof("") - 1
+
+# derived key material created while (de)crypting, wiped by wipe_derived_keys()
+_derived_keys = []
+
+
+def wipe(obj):
+    """Overwrite the memory of a bytes-like or ASCII str object with zeros."""
+    if obj is None:
+        return
+    if isinstance(obj, bytearray):
+        if obj:
+            buf = (ctypes.c_char * len(obj)).from_buffer(obj)
+            ctypes.memset(ctypes.addressof(buf), 0, len(obj))
+            del buf
+    elif isinstance(obj, bytes):
+        # objects of length 0/1 are interpreter-wide singletons - never touch
+        if len(obj) > 1:
+            ctypes.memset(id(obj) + _BYTES_DATA_OFFSET, 0, len(obj))
+    elif isinstance(obj, str):
+        # only compact ASCII strings have a predictable layout
+        if len(obj) > 1 and obj.isascii():
+            ctypes.memset(id(obj) + _STR_DATA_OFFSET, 0, len(obj))
+
+
+class Secret:
+    """A password held in a wipeable bytearray."""
+
+    __slots__ = ("buf",)
+
+    def __init__(self, buf):
+        self.buf = buf
+
+    def encode(self, *_args, **_kwargs):
+        return self.buf
+
+    def __len__(self):
+        return len(self.buf)
+
+    def __eq__(self, other):
+        return isinstance(other, Secret) and hmac.compare_digest(self.buf, other.buf)
+
+    __hash__ = None
+
+    def __repr__(self):
+        return "<Secret ***>"
+
+    __str__ = __repr__
+
+    def wipe(self):
+        wipe(self.buf)
+        self.buf.clear()
+
+
+def _secure_compute_key_composite(password=None, keyfile=None):
+    """Replacement for pykeepass' composite key computation that works on
+    `Secret` objects and remembers intermediate keys so they can be wiped."""
+    if not isinstance(password, Secret) or keyfile:
+        return _original_compute_key_composite(password=password, keyfile=keyfile)
+    password_composite = hashlib.sha256(password.buf).digest()
+    composite = hashlib.sha256(password_composite).digest()
+    _derived_keys.extend((password_composite, composite))
+    return composite
+
+
+_original_compute_key_composite = kdbx_common.compute_key_composite
+for _module in (kdbx_common, kdbx_v3, kdbx_v4):
+    _module.compute_key_composite = _secure_compute_key_composite
+
+
+def wipe_derived_keys():
+    for key in _derived_keys:
+        wipe(key)
+    _derived_keys.clear()
+
+
+def wipe_database_keys(kp):
+    """Zero all key material pykeepass keeps for an opened database."""
+    body = kp.kdbx.body
+    for name in ("transformed_key", "master_key"):
+        wipe(body.get(name))
+    if kp.version >= (4, 0):
+        wipe(kp.kdbx.body.payload.inner_header.protected_stream_key.data)
+    else:
+        wipe(kp.kdbx.header.value.dynamic_header.protected_stream_key.data)
+    kp._password = None
+    wipe_derived_keys()
+
+
+def harden_process():
+    """Disable core dumps and ptrace / /proc/<pid>/mem access by other
+    processes of the same user (Linux), so memory cannot be easily dumped."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, ValueError, OSError):
+        pass
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        PR_SET_DUMPABLE = 4
+        libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def read_secret(prompt):
+    """Read a password without echo into a bytearray (never into a str).
+
+    Reads byte by byte: single bytes are interpreter singletons in CPython, so
+    no copy of the password ends up in a heap object we cannot wipe."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    buf = bytearray()
+    fd = sys.stdin.fileno()
+    if os.isatty(fd):
+        import termios
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~(termios.ECHO | termios.ICANON)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        try:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+            while True:
+                ch = os.read(fd, 1)
+                if ch in (b"", b"\n", b"\r"):
+                    break
+                if ch in (b"\x7f", b"\x08"):          # backspace
+                    if buf:
+                        # drop a whole UTF-8 sequence
+                        while buf and (buf[-1] & 0xC0) == 0x80:
+                            buf[-1] = 0
+                            del buf[-1]
+                        if buf:
+                            buf[-1] = 0
+                            del buf[-1]
+                    continue
+                if ch == b"\x15":                     # Ctrl-U
+                    wipe(buf)
+                    buf.clear()
+                    continue
+                if ch == b"\x04" and not buf:         # Ctrl-D
+                    break
+                buf += ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+            sys.stderr.write("\n")
+    else:
+        # non-interactive (piped) input: one password per line
+        while True:
+            ch = os.read(fd, 1)
+            if ch in (b"", b"\n"):
+                break
+            buf += ch
+        if buf.endswith(b"\r"):
+            buf[-1] = 0
+            del buf[-1]
+    # bytearray growth may have left stale copies in freed memory; copy into
+    # an exactly sized buffer allocated once and wipe the original
+    result = bytearray(len(buf))
+    result[:] = buf
+    wipe(buf)
+    return Secret(result)
+
+
+def read_line(prompt):
+    """Read a (non-secret) answer line. Reads unbuffered so it never swallows
+    input meant for a following password prompt."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    chars = []
+    while True:
+        ch = os.read(sys.stdin.fileno(), 1)
+        if ch in (b"", b"\n"):
+            break
+        chars.append(ch)
+    return b"".join(chars).decode("utf-8", "replace").strip()
+
+
+def secret_from_argv(value):
+    """Turn a command line password into a Secret and wipe the str copy."""
+    secret = Secret(bytearray(value.encode("utf-8")))
+    for i, arg in enumerate(sys.argv):
+        if arg is value or arg == value:
+            wipe(arg)
+            sys.argv[i] = "***"
+    wipe(value)
+    return secret
+
+
+def _read_process_output(cmd):
+    """Run cmd, return (returncode, stdout as bytearray, stderr text)."""
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, bufsize=0)
+    out = bytearray(1 << 16)
+    used = 0
+    while True:
+        if used == len(out):
+            bigger = bytearray(len(out) * 2)
+            bigger[:used] = out
+            wipe(out)
+            out = bigger
+        view = memoryview(out)[used:]
+        n = proc.stdout.readinto(view)
+        view.release()
+        if not n:
+            break
+        used += n
+    err = proc.stderr.read().decode("utf-8", "replace").strip()
+    proc.wait()
+    result = bytearray(used)
+    result[:] = memoryview(out)[:used]
+    wipe(out)
+    return proc.returncode, result, err
+
+
+def _require_secret_tool():
+    if shutil.which("secret-tool") is None:
+        raise SystemExit("error: secret-tool not found (package libsecret-tools)")
+
+
+def secret_from_secret_tool(spec):
+    """Fetch a password from the Secret Service via `secret-tool`.
+
+    spec is either
+      * attribute=value pairs separated by commas, e.g. "service=kdbx,user=me"
+        -> `secret-tool lookup service kdbx user me`
+      * a plain label (as given by `secret-tool store --label=...`)
+        -> the item with exactly that label among items stored by secret-tool
+    """
+    _require_secret_tool()
+    if "=" in spec:
+        cmd = ["secret-tool", "lookup"]
+        for pair in spec.split(","):
+            key, _, value = pair.partition("=")
+            cmd += [key.strip(), value.strip()]
+        code, out, err = _read_process_output(cmd)
+        if code != 0 or not out:
+            wipe(out)
+            raise SystemExit(f"error: secret-tool found no secret for {spec!r} {err}".rstrip())
+        return Secret(out)
+
+    cmd = ["secret-tool", "search", "--all", "--unlock",
+           "xdg:schema", "org.freedesktop.Secret.Generic"]
+    code, out, err = _read_process_output(cmd)
+    try:
+        # output: blocks of "[path]\nlabel = X\nsecret = Y\n..." lines
+        matches = []
+        current_label = None
+        pos = 0
+        label_prefix, secret_prefix = b"label = ", b"secret = "
+        while pos < len(out):
+            end = out.find(b"\n", pos)
+            if end < 0:
+                end = len(out)
+            if out.startswith(b"[", pos):
+                current_label = None
+            elif out.startswith(label_prefix, pos):
+                current_label = bytes(out[pos + len(label_prefix):end]).decode("utf-8", "replace")
+            elif out.startswith(secret_prefix, pos) and current_label == spec:
+                start = pos + len(secret_prefix)
+                found = bytearray(end - start)
+                found[:] = memoryview(out)[start:end]
+                matches.append(found)
+            pos = end + 1
+    finally:
+        wipe(out)
+    if not matches:
+        raise SystemExit(f"error: secret-tool has no item labelled {spec!r} {err}".rstrip())
+    if len(matches) > 1:
+        for m in matches:
+            wipe(m)
+        raise SystemExit(f"error: several secret-tool items are labelled {spec!r}; "
+                         "use attribute=value lookup instead")
+    return Secret(matches[0])
+
+
+# ---------------------------------------------------------------------------
+# Input credentials
+# ---------------------------------------------------------------------------
+
+class Credentials:
+    """Obtains input database passwords.
+
+    mode "user":        passwords typed by the user
+    mode "secret-tool": password stored in the Secret Service under the
+                        attribute  service = "<PIN>-<absolute file path>"
+                        (the path as given on the command line works too)
+
+    Every password that opened a file is kept in a pool and tried on the
+    following files before asking again.  The pool and the PIN are wiped as
+    soon as the last input file has been opened.
+    """
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.pool = []
+        self.pin = None
+        if mode == "secret-tool":
+            _require_secret_tool()
+            self.pin = read_secret("secret-tool PIN: ")
+
+    def wipe(self):
+        for s in self.pool:
+            s.wipe()
+        self.pool.clear()
+        if self.pin is not None:
+            self.pin.wipe()
+            self.pin = None
+        wipe_derived_keys()
+        gc.collect()
+
+    def _remember(self, secret):
+        if any(secret == s for s in self.pool):
+            secret.wipe()
+        else:
+            self.pool.append(secret)
+
+    def _lookup(self, path):
+        candidates = [os.path.abspath(path)]
+        if path != candidates[0]:
+            candidates.append(path)
+        for candidate in candidates:
+            service = bytearray(self.pin.buf)
+            service += b"-" + os.fsencode(candidate)
+            arg = bytes(service)
+            wipe(service)
+            try:
+                code, out, _err = _read_process_output(
+                    [b"secret-tool", b"lookup", b"service", arg])
+            finally:
+                wipe(arg)
+            if code == 0 and out:
+                return Secret(out)
+            wipe(out)
+        return None
+
+    def open(self, path, attempt):
+        """Call attempt(secret) with candidate passwords until it returns a
+        result (not None); return that result."""
+        if self.mode == "secret-tool":
+            secret = self._lookup(path)
+            if secret is None:
+                print(f"  no secret-tool entry for {path}", file=sys.stderr)
+            else:
+                result = attempt(secret)
+                if result is not None:
+                    self._remember(secret)
+                    return result
+                secret.wipe()
+                print(f"  secret-tool password for {path} does not work", file=sys.stderr)
+
+        for secret in self.pool:
+            result = attempt(secret)
+            if result is not None:
+                return result
+
+        if self.mode == "user":
+            for n in range(3):
+                secret = read_secret(f"Password for {path}: ")
+                result = attempt(secret)
+                if result is not None:
+                    self._remember(secret)
+                    return result
+                secret.wipe()
+                print(f"  wrong password for {path}" + (", try again" if n < 2 else ""),
+                      file=sys.stderr)
+            raise SystemExit(f"error: could not open {path}: invalid credentials")
+
+        while True:
+            answer = read_line(f"No working password for {path}. "
+                               "[p]rovide password or [c]ancel merging? ").lower()
+            if answer in ("p", "provide"):
+                secret = read_secret(f"Password for {path}: ")
+                result = attempt(secret)
+                if result is not None:
+                    self._remember(secret)
+                    return result
+                secret.wipe()
+                print(f"  wrong password for {path}", file=sys.stderr)
+            elif answer in ("c", "cancel", ""):
+                raise SystemExit(f"merging cancelled at {path}; nothing was written")
+
+
+# ---------------------------------------------------------------------------
+# Reading input databases
+# ---------------------------------------------------------------------------
+
+TIME_TAGS = ("CreationTime", "LastModificationTime", "LastAccessTime",
+             "ExpiryTime", "LocationChanged", "DeletionTime")
+
+
+def _read_file(path):
+    with open(path, "rb") as fh:          # strictly read-only
+        return fh.read()
+
+
+def open_first(path, creds):
+    """Open the first input in this process - it becomes the output."""
+    data = _read_file(path)
+
+    def attempt(secret):
+        try:
+            return PyKeePass(io.BytesIO(data), password=secret)
+        except CredentialsError:
+            wipe_derived_keys()
+            return None
+
+    kp = creds.open(path, attempt)
+    wipe_database_keys(kp)
+    return kp
+
+
+def export_source(src_kp, out_kp):
+    """(child) Extract everything that will be merged, with times already
+    converted to the output's KDBX format."""
+    root = src_kp.tree.getroot()
+    if src_kp.version[0] != out_kp.version[0]:
+        for t in root.iter(*TIME_TAGS):
+            if t.text:
+                t.text = out_kp._encode_time(src_kp._decode_time(t.text))
+    container = etree.Element("Source")
+    icons = etree.SubElement(container, "CustomIcons")
+    for icon in root.xpath("/KeePassFile/Meta/CustomIcons/Icon"):
+        icons.append(icon)
+    container.append(root.find("Root/Group"))
+    binaries = []
+    for i, data in enumerate(src_kp.binaries):
+        protected = True
+        if src_kp.version >= (4, 0):
+            protected = bool(src_kp.payload.inner_header.binary[i].data[0] & 1)
+        binaries.append((data, protected))
+    return {"xml": etree.tostring(container), "binaries": binaries}
+
+
+def _read_exact(fd, n):
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+        k = os.readv(fd, [view[got:]])
+        if k == 0:
+            break
+        got += k
+    view.release()
+    return buf, got
+
+
+def load_source(path, creds, out_kp):
+    """Decrypt an input in a forked child; the child only sends back the data
+    to merge.  Password, keys and the decrypted file die with the child."""
+    def attempt(secret):
+        r, w = os.pipe()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+        if pid == 0:                                   # child
+            code = 1
+            try:
+                os.close(r)
+                try:
+                    kp = PyKeePass(io.BytesIO(_read_file(path)), password=secret)
+                except CredentialsError:
+                    code = 3
+                else:
+                    payload = pickle.dumps(export_source(kp, out_kp), protocol=5)
+                    with os.fdopen(w, "wb") as out:
+                        out.write(struct.pack("<Q", len(payload)))
+                        out.write(payload)
+                    code = 0
+            except BaseException:
+                traceback.print_exc()
+            finally:
+                os._exit(code)
+        os.close(w)
+        try:
+            header, got = _read_exact(r, 8)
+            frame = None
+            if got == 8:
+                frame, got = _read_exact(r, struct.unpack("<Q", header)[0])
+        finally:
+            os.close(r)
+        code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+        if code == 3:
+            return None
+        if code != 0 or frame is None or got != len(frame):
+            raise SystemExit(f"error: failed to read {path}")
+        try:
+            return pickle.loads(frame)
+        finally:
+            wipe(frame)
+
+    return creds.open(path, attempt)
+
+
+def wipe_source(source):
+    wipe(source["xml"])
+    for data, _ in source["binaries"]:
+        wipe(data)
+    source.clear()
+
+
+# ---------------------------------------------------------------------------
+# Merging
+# ---------------------------------------------------------------------------
+
+def _string_field(entry_el, key):
+    """Return the <Value> element of the entry string field `key` (or None)."""
+    for s in entry_el.findall("String"):
+        if s.findtext("Key") == key:
+            return s.find("Value")
+    return None
+
+
+def _title(entry_el):
+    value = _string_field(entry_el, "Title")
+    return (value.text or "") if value is not None else ""
+
+
+def _set_string(entry_el, key, text):
+    value = _string_field(entry_el, key)
+    if value is None:
+        s = etree.Element("String")
+        etree.SubElement(s, "Key").text = key
+        value = etree.SubElement(s, "Value")
+        # keep schema order: String elements come before Binary/AutoType/History
+        anchor = None
+        for tag in ("Binary", "AutoType", "History"):
+            anchor = entry_el.find(tag)
+            if anchor is not None:
+                break
+        if anchor is not None:
+            anchor.addprevious(s)
+        else:
+            entry_el.append(s)
+    value.text = text
+
+
+def _append_note(entry_el, line):
+    notes_el = _string_field(entry_el, "Notes")
+    notes = (notes_el.text or "") if notes_el is not None else ""
+    _set_string(entry_el, "Notes", f"{notes}\n{line}" if notes else line)
+
+
+def _lookalike_key(name):
+    """Key under which names that merely look the same collide."""
+    return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
+
+
+def _lookalike_reason(a, b):
+    if unicodedata.normalize("NFC", a) == unicodedata.normalize("NFC", b):
+        return "differs only in how accented characters are encoded (NFC/NFD)"
+    if " ".join(a.split()) == " ".join(b.split()):
+        return "differs only in spaces"
+    if a.casefold() == b.casefold():
+        return "differs only in letter case"
+    return "differs only in case, spaces or character encoding"
+
+
+def _new_uuid():
+    return base64.b64encode(uuid.uuid4().bytes).decode()
+
+
+# Meta elements that reference a folder by UUID
+GROUP_REFS = ("RecycleBinUUID", "EntryTemplatesGroup", "LastSelectedGroup",
+              "LastTopVisibleGroup")
+
+
+class Merger:
+    def __init__(self, out_kp, first_label, verbose=False):
+        self.out = out_kp
+        self.verbose = verbose
+        root = out_kp.tree.getroot()
+        self.out_root_group = root.find("Root/Group")
+        self.uuids = {u.text for u in root.xpath(
+            "//Group/UUID | //Entry[not(parent::History)]/UUID")}
+        self.icons = {}
+        for icon in root.xpath("/KeePassFile/Meta/CustomIcons/Icon"):
+            self.icons[icon.findtext("UUID")] = icon.findtext("Data")
+        # (target group UUID, base title) -> last index used
+        self.last_index = {}
+        # sha256(binary) -> id in output binary pool
+        self.binary_ids = {}
+        for i, data in enumerate(out_kp.binaries):
+            self.binary_ids.setdefault(hashlib.sha256(data).hexdigest(), i)
+        # output binary id -> input files (ordered) / (entry, attachment name)
+        self.binary_files = {}
+        self.binary_users = {}
+        for e in root.xpath("//Entry[not(parent::History)]"):
+            self._track_attachments(e, first_label)
+        self.stats = dict(groups_created=0, groups_reused=0, groups_joined=0, lookalikes=0,
+                          entries_copied=0, entries_renamed=0, attachment_notes=0)
+        self._join_same_named_groups(self.out_root_group, first_label, [])
+
+    # -- helpers --------------------------------------------------------------
+
+    def _track_attachments(self, entry_el, label):
+        for b in entry_el.findall("Binary"):
+            ref = b.find("Value")
+            if ref is None or ref.get("Ref") is None:
+                continue
+            bid = int(ref.get("Ref"))
+            self.binary_files.setdefault(bid, {})[label] = None
+            self.binary_users.setdefault(bid, []).append((entry_el, b.findtext("Key") or ""))
+
+    def _unique_uuid(self, value):
+        if value and value not in self.uuids:
+            self.uuids.add(value)
+            return value
+        new = _new_uuid()
+        self.uuids.add(new)
+        return new
+
+    def _fix_icons(self, el):
+        for ref in el.iter("CustomIconUUID"):
+            if ref.text in self.icon_map:
+                ref.text = self.icon_map[ref.text]
+
+    def _copy_custom_icons(self, src_icons):
+        self.icon_map = {}
+        if not len(src_icons):
+            return
+        meta = self.out.tree.getroot().find("Meta")
+        container = meta.find("CustomIcons")
+        if container is None:
+            container = etree.SubElement(meta, "CustomIcons")
+        for icon in list(src_icons):
+            icon_uuid, data = icon.findtext("UUID"), icon.findtext("Data")
+            if self.icons.get(icon_uuid) == data:
+                continue
+            if icon_uuid in self.icons:
+                new_uuid = _new_uuid()
+                self.icon_map[icon_uuid] = new_uuid
+                icon.find("UUID").text = new_uuid
+                icon_uuid = new_uuid
+            container.append(icon)
+            self.icons[icon_uuid] = data
+
+    def _binary_id(self, src_id):
+        if src_id in self.binary_map:
+            return self.binary_map[src_id]
+        data, protected = self.src_binaries[src_id]
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in self.binary_ids:
+            new_id = self.binary_ids[digest]
+        else:
+            new_id = self.out.add_binary(data, compressed=True, protected=protected)
+            self.binary_ids[digest] = new_id
+        self.binary_map[src_id] = new_id
+        return new_id
+
+    def _next_index(self, group_el, title):
+        pattern = re.compile(re.escape(title) + r" - (\d+)$")
+        highest = 0
+        for e in group_el.findall("Entry"):
+            m = pattern.match(_title(e))
+            if m:
+                highest = max(highest, int(m.group(1)))
+        key = (group_el.findtext("UUID"), title)
+        index = max(highest, self.last_index.get(key, 0)) + 1
+        self.last_index[key] = index
+        return index
+
+    # -- merge ------------------------------------------------------------------
+
+    def merge(self, source, source_label):
+        """Merge data exported by export_source().  Source elements are moved
+        (not copied) into the output tree."""
+        parser = etree.XMLParser(huge_tree=True, resolve_entities=False)
+        container = etree.fromstring(source["xml"], parser)
+        self.source_label = source_label
+        self.src_binaries = source["binaries"]
+        self.binary_map = {}
+        self._copy_custom_icons(container.find("CustomIcons"))
+        self._merge_group(container.find("Group"), self.out_root_group, [])
+        self.src_binaries = None
+
+    def _merge_group(self, src_group, out_group, path):
+        for child in list(src_group):
+            if child.tag == "Entry":
+                self._copy_entry(child, out_group, path)
+            elif child.tag == "Group":
+                name = child.findtext("Name") or ""
+                target = None
+                for g in out_group.findall("Group"):
+                    if (g.findtext("Name") or "") == name:
+                        target = g
+                        break
+                if target is None:
+                    target = etree.Element("Group")
+                    for prop in child:
+                        if prop.tag not in ("Entry", "Group"):
+                            target.append(copy.deepcopy(prop))
+                    target.find("UUID").text = self._unique_uuid(target.findtext("UUID"))
+                    self._fix_icons(target)
+                    out_group.append(target)
+                    self.stats["groups_created"] += 1
+                    self._warn_lookalike(
+                        "folder", name,
+                        [g.findtext("Name") or "" for g in out_group.findall("Group")
+                         if g is not target], path)
+                else:
+                    self.stats["groups_reused"] += 1
+                self._merge_group(child, target, path + [name])
+
+    def _warn_lookalike(self, kind, name, siblings, path):
+        """Inform about a name that is not identical to, but looks like, a
+        sibling's name. Such names are kept separate."""
+        key = _lookalike_key(name)
+        for other in siblings:
+            if other != name and _lookalike_key(other) == key:
+                where = "/".join(path) or "(root)"
+                print(f"  note: {kind} {name!r} in {where} kept separate from {other!r}: "
+                      f"{_lookalike_reason(name, other)}", file=sys.stderr)
+                self.stats["lookalikes"] += 1
+
+    def _join_same_named_groups(self, group, label, path):
+        """Folders are never duplicated: sibling folders with the same name
+        (possible in KDBX, folders are identified by UUID) are joined into the
+        first one; their items follow the usual duplicate-title rules."""
+        first_by_name = {}
+        for g in group.findall("Group"):
+            name = g.findtext("Name") or ""
+            keep = first_by_name.setdefault(name, g)
+            if keep is g:
+                continue
+            for child in list(g):
+                if child.tag == "Entry":
+                    self._place_entry(child, keep, label, path + [name])
+                elif child.tag == "Group":
+                    keep.append(child)        # joined in the recursion below
+            notes, kept_notes = g.findtext("Notes") or "", keep.findtext("Notes") or ""
+            if notes and notes != kept_notes:
+                notes_el = keep.find("Notes")
+                if notes_el is None:
+                    notes_el = etree.Element("Notes")
+                    keep.find("Name").addnext(notes_el)
+                notes_el.text = f"{kept_notes}\n{notes}" if kept_notes else notes
+            # references to the removed folder now point to the kept one
+            gone, kept = g.findtext("UUID"), keep.findtext("UUID")
+            for ref in self.out.tree.getroot().find("Meta"):
+                if ref.text == gone and ref.tag in GROUP_REFS:
+                    ref.text = kept
+            group.remove(g)
+            self.stats["groups_joined"] += 1
+            if self.verbose:
+                print(f"  joined folder: {'/'.join(path + [name])}", file=sys.stderr)
+        names = list(first_by_name)
+        for i, name in enumerate(names):
+            self._warn_lookalike("folder", name, names[:i], path)
+        titles = [_title(e) for e in group.findall("Entry")]
+        for i, title in enumerate(titles):
+            self._warn_lookalike("item", title, titles[:i], path)
+        for g in group.findall("Group"):
+            self._join_same_named_groups(g, label, path + [g.findtext("Name") or ""])
+
+    def _copy_entry(self, entry, out_group, path):
+        entry.find("UUID").text = self._unique_uuid(entry.findtext("UUID"))
+        for ref in entry.xpath(".//Binary/Value[@Ref]"):
+            ref.set("Ref", str(self._binary_id(int(ref.get("Ref")))))
+        self._fix_icons(entry)
+        self._place_entry(entry, out_group, self.source_label, path)
+        self._track_attachments(entry, self.source_label)
+        self.stats["entries_copied"] += 1
+
+    def _place_entry(self, entry, out_group, label, path):
+        """Put entry into out_group, indexing its title if already taken."""
+        title = _title(entry)
+        existing = {_title(e) for e in out_group.findall("Entry")}
+        if title not in existing:
+            self._warn_lookalike("item", title, existing, path)
+        if title in existing:
+            index = self._next_index(out_group, title)
+            new_title = f"{title} - {index}"
+            _set_string(entry, "Title", new_title)
+            _append_note(entry, f"source: {label}")
+            self.stats["entries_renamed"] += 1
+            if self.verbose:
+                print(f"  duplicate: {'/'.join(path + [title])} -> {new_title!r}",
+                      file=sys.stderr)
+
+        first_group = out_group.find("Group")
+        if first_group is not None:
+            first_group.addprevious(entry)
+        else:
+            out_group.append(entry)
+
+    def finish(self):
+        """Note on every entry whose attachment was found in several input
+        files, listing all of them (command line order)."""
+        for bid, files in self.binary_files.items():
+            if len(files) < 2:
+                continue
+            where = ", ".join(files)
+            for entry, name in self.binary_users[bid]:
+                _append_note(entry, f'same attachment "{name}" found in: {where}')
+                self.stats["attachment_notes"] += 1
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_output(kp, path, force):
+    """Serialize and write the database without clobbering existing files
+    (unless force) and without leaving partial files behind."""
+    buf = io.BytesIO()
+    kp.save(buf)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".merge-kdbx-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(buf.getbuffer())
+            fh.flush()
+            os.fsync(fh.fileno())
+        if force:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)      # atomic, fails if path exists
+            os.unlink(tmp)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def obtain_output_secret(args):
+    if args.password is not None:
+        print("warning: a password given on the command line may be visible to other "
+              "users (ps, shell history)", file=sys.stderr)
+        return secret_from_argv(args.password)
+    if args.secret_tool is not None:
+        return secret_from_secret_tool(args.secret_tool)
+    for _ in range(3):
+        first = read_secret(f"New password for {args.output}: ")
+        second = read_secret(f"Retype password for {args.output}: ")
+        if first == second:
+            second.wipe()
+            if not len(first):
+                print("warning: the merged database has an empty password", file=sys.stderr)
+            return first
+        first.wipe()
+        second.wipe()
+        print("  passwords do not match, try again", file=sys.stderr)
+    raise SystemExit("error: passwords did not match")
+
+
+HELP_EPILOG = """\
+input password methods (-ip):
+  user          Passwords are typed by the user. Every password that worked is
+                tried on the following files first, so a password shared by
+                several files is typed only once. After 3 wrong attempts the
+                merge stops.
+  secret-tool   Passwords are read from the Secret Service (GNOME Keyring,
+                KeePassXC, ...) with `secret-tool`. The script asks once for a
+                PIN; the password of FILE is looked up under the attribute
+                    service = "<PIN>-<absolute path of FILE>"
+                (the path exactly as written on the command line is tried
+                too). Store one like this:
+                    secret-tool store --label="kdbx file1" \\
+                        service "1234-/home/me/file1.kdbx"
+                If there is no entry, or it does not work, passwords of the
+                previous files are tried; if none works you are asked whether
+                to type the password or cancel the merge.
+
+output password (-p / -ps / prompt):
+  -p PASSWORD   given on the command line (visible in ps and shell history)
+  -ps SPEC      from secret-tool: an item label, or attribute=value pairs
+                ("service=kdbx-out,user=me") for `secret-tool lookup`
+  (neither)     typed twice at the prompt
+
+duplicates:
+  An entry whose title already exists in the same folder is added as
+  "title - N" (N = highest existing index + 1) with "source: <file>" appended
+  to its notes. Identical attachments are stored once; entries carrying them
+  get a note listing every input file in which the attachment was found.
+  Folders are never duplicated: folders with the same path are one folder,
+  also when a single input file contains same-named sibling folders.
+  Names must be truly identical to match. Names that only look alike
+  (letter case, extra spaces, differently encoded accents) are kept separate
+  and reported during the merge.
+
+example:
+  merge-kdbx -i file1.kdbx some/path/file2.kdbx -ip user -o merged.kdbx -p pw
+"""
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="merge-kdbx",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Merge several KeePass KDBX files into one new KDBX file. "
+                    "The first input is copied 1:1, the others are merged into it in "
+                    "command line order. Nothing is overwritten; input files are "
+                    "opened read-only.",
+        epilog=HELP_EPILOG,
+    )
+    p.add_argument("-i", "--input", nargs="+", required=True, metavar="FILE",
+                   help="input KDBX files (at least 2), in priority order")
+    p.add_argument("-ip", "--input-password", choices=["user", "secret-tool"],
+                   default="user", metavar="{user,secret-tool}",
+                   help="how input passwords are obtained (default: user, see below)")
+    p.add_argument("-o", "--output", required=True, metavar="FILE",
+                   help="output KDBX file (must not exist unless --force)")
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("-p", "--password", metavar="PASSWORD",
+                     help="password for the output file (insecure: visible in ps/history)")
+    out.add_argument("-ps", "--secret-tool", metavar="SPEC",
+                     help="take the output password from secret-tool: an item label, "
+                          "or attribute=value pairs for 'secret-tool lookup'")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="overwrite an existing output file (never an input file)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="list renamed duplicate entries")
+    args = p.parse_args(argv)
+    if len(args.input) < 2:
+        p.error("at least two input files are required")
+    return args
+
+
+def main(argv=None):
+    harden_process()
+    os.umask(0o077)
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    for path in args.input:
+        if not os.path.isfile(path):
+            raise SystemExit(f"error: input file not found: {path}")
+    if os.path.exists(args.output):
+        if any(os.path.samefile(args.output, p) for p in args.input):
+            raise SystemExit("error: output file is one of the input files")
+        if not args.force:
+            raise SystemExit(f"error: output file exists: {args.output} (use --force)")
+
+    output_secret = None
+    if args.password is not None:
+        # move the argv password into a wipeable buffer right away
+        output_secret = obtain_output_secret(args)
+        args.password = None
+
+    creds = None
+    out_kp = None
+    try:
+        creds = Credentials(args.input_password)
+        out_kp = open_first(args.input[0], creds)
+        print(f"copied   {args.input[0]}", file=sys.stderr)
+        merger = Merger(out_kp, args.input[0], verbose=args.verbose)
+        for i, path in enumerate(args.input[1:], start=1):
+            source = load_source(path, creds, out_kp)
+            if i == len(args.input) - 1:
+                creds.wipe()                    # no more files to open
+            try:
+                merger.merge(source, path)
+            finally:
+                wipe_source(source)
+                del source
+                gc.collect()
+            print(f"merged   {path}", file=sys.stderr)
+        merger.finish()
+
+        if output_secret is None:
+            output_secret = obtain_output_secret(args)
+        out_kp.password = output_secret
+        out_kp._keyfile = None
+        write_output(out_kp, args.output, args.force)
+        s = merger.stats
+        print(f"written  {args.output}: {s['entries_copied']} entries merged "
+              f"({s['entries_renamed']} renamed as duplicates), "
+              f"{s['groups_created']} groups created, "
+              f"{s['groups_joined']} same-named groups joined", file=sys.stderr)
+    finally:
+        if creds is not None:
+            creds.wipe()
+        if output_secret is not None:
+            output_secret.wipe()
+        if out_kp is not None:
+            out_kp._password = None
+            try:
+                wipe_database_keys(out_kp)
+            except Exception:
+                pass
+        wipe_derived_keys()
+        gc.collect()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\naborted", file=sys.stderr)
+        sys.exit(130)
