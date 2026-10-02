@@ -17,6 +17,7 @@ Run:  ./tests/test_merge_kdbx.py   (or: uv run --script tests/test_merge_kdbx.py
 import base64
 import hashlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -752,6 +753,86 @@ class TestFoldersNeverDuplicated(MergeTestCase):
         self.assertEqual(len(kp.groups), 1 + 2)
         self.assertEqual(kp.tree.getroot().findtext("Meta/RecycleBinUUID"),
                          base64.b64encode(a1.uuid.bytes).decode())
+
+class TestWildcards(MergeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.flowers = self.tmp / "kvety 花"
+        self.flowers.mkdir()
+        for name, title in (("flower-b.kdbx", "B"), ("flower-a.kdbx", "A"),
+                            ("flower č.kdbx", "C"), ("flowerpot.txt", None),
+                            ("tree.kdbx", "T")):
+            path = self.flowers / name
+            if title is None:
+                path.write_text("not a database")
+                continue
+            kp = create_database(str(path), password=PW_A)
+            kp.add_entry(kp.root_group, "shared", "u", f"pw-{title}")
+            kp.save()
+
+    def titles_in_order(self, out):
+        kp = PyKeePass(str(out), password=PW_OUT)
+        return {e.title: e.password for e in kp.root_group.entries}
+
+    def test_quoted_pattern_expanded_in_sorted_order(self):
+        proc = self.run_merge("-i", "kvety 花/flower*.kdbx", "-o", self.out, "-p", PW_OUT,
+                              stdin=f"{PW_A}\n")
+        err = proc.stderr.decode()
+        self.assertIn("1. kvety 花/flower č.kdbx\n  2. kvety 花/flower-a.kdbx\n"
+                      "  3. kvety 花/flower-b.kdbx", err)
+        self.assertEqual(self.titles_in_order(self.out),
+                         {"shared": "pw-C", "shared - 1": "pw-A", "shared - 2": "pw-B"})
+        kp = PyKeePass(str(self.out), password=PW_OUT)
+        self.assertEqual(entry(kp.root_group, "shared - 2").notes,
+                         "source: kvety 花/flower-b.kdbx")
+
+    def test_shell_expanded_pattern(self):
+        proc = subprocess.run(
+            f"{shlex.quote(str(SCRIPT))} -i kvety\\ 花/flower-?.kdbx -o merged.kdbx -p {PW_OUT}",
+            shell=True, input=f"{PW_A}\n".encode(), capture_output=True, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertEqual(self.titles_in_order(self.out),
+                         {"shared": "pw-A", "shared - 1": "pw-B"})
+
+    def test_pattern_keeps_its_place_among_explicit_files(self):
+        self.run_merge("-i", "kvety 花/tree.kdbx", "kvety 花/flower-[ab].kdbx",
+                       "-o", self.out, "-p", PW_OUT, stdin=f"{PW_A}\n")
+        self.assertEqual(self.titles_in_order(self.out),
+                         {"shared": "pw-T", "shared - 1": "pw-A", "shared - 2": "pw-B"})
+
+    def test_recursive_pattern(self):
+        self.run_merge("-i", "**/flower-*.kdbx", "-o", self.out, "-p", PW_OUT,
+                       stdin=f"{PW_A}\n")
+        self.assertEqual(len(self.titles_in_order(self.out)), 2)
+
+    def test_no_match_is_an_error(self):
+        proc = self.run_merge("-i", "file1.kdbx", "rose*.kdbx", "-o", self.out,
+                              "-p", PW_OUT, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no input file matches 'rose*.kdbx'", proc.stderr.decode())
+
+    def test_file_matched_twice_used_once(self):
+        proc = self.run_merge("-i", "kvety 花/flower-a.kdbx", "kvety 花/flower-*.kdbx",
+                              "-o", self.out, "-p", PW_OUT, stdin=f"{PW_A}\n")
+        self.assertIn("flower-a.kdbx is given more than once", proc.stderr.decode())
+        self.assertEqual(self.titles_in_order(self.out),
+                         {"shared": "pw-A", "shared - 1": "pw-B"})
+
+    def test_output_never_used_as_input(self):
+        out = self.flowers / "flower-merged.kdbx"
+        self.run_merge("-i", "kvety 花/flower-*.kdbx", "-o", out, "-p", PW_OUT,
+                       stdin=f"{PW_A}\n")
+        proc = self.run_merge("-i", "kvety 花/flower-*.kdbx", "-o", out, "-p", PW_OUT,
+                              "--force", stdin=f"{PW_A}\n")
+        self.assertIn("is the output file, skipped", proc.stderr.decode())
+        self.assertEqual(len(self.titles_in_order(out)), 2)
+
+    def test_pattern_with_single_match_needs_another_file(self):
+        proc = self.run_merge("-i", "kvety 花/tree*.kdbx", "-o", self.out, "-p", PW_OUT,
+                              check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("at least two input files are required, found 1",
+                      proc.stderr.decode())
 
 
 if __name__ == "__main__":

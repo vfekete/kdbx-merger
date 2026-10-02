@@ -35,6 +35,7 @@ import base64
 import copy
 import ctypes
 import gc
+import glob
 import hashlib
 import hmac
 import io
@@ -950,9 +951,54 @@ duplicates:
   (letter case, extra spaces, differently encoded accents) are kept separate
   and reported during the merge.
 
+input file wildcards:
+  -i 'flower*.kdbx' uses every file matching the pattern (quoted or not).
+  Matches of one pattern are merged in sorted order, at the pattern's place on
+  the command line, e.g.  -i main.kdbx 'backup/*.kdbx'  merges main.kdbx first.
+  A file matched or listed more than once is used once; the output file is
+  never used as input. The final merge order is printed.
+
 example:
   merge-kdbx -i file1.kdbx some/path/file2.kdbx -ip user -o merged.kdbx -p pw
 """
+
+
+def expand_inputs(args):
+    """Expand wildcard patterns in input names (also when quoted, so the shell
+    did not expand them). Matches of one pattern are used in sorted order, at
+    the pattern's place on the command line. A file is used only once, and the
+    output file is never used as input."""
+    paths, seen, expanded = [], set(), False
+    for arg in args.input:
+        if os.path.exists(arg) or not re.search(r"[*?[]", arg):
+            matches = [arg]
+        else:
+            matches = sorted(m for m in glob.glob(arg, recursive=True) if os.path.isfile(m))
+            if not matches:
+                raise SystemExit(f"error: no input file matches {arg!r}")
+            expanded = True
+        for path in matches:
+            if not os.path.isfile(path):
+                raise SystemExit(f"error: input file not found: {path}")
+            real = os.path.realpath(path)
+            if real in seen:
+                print(f"  note: {path} is given more than once, using it only once",
+                      file=sys.stderr)
+                continue
+            if (matches != [arg] and os.path.exists(args.output)
+                    and os.path.samefile(path, args.output)):
+                print(f"  note: {path} matches {arg!r} but is the output file, skipped",
+                      file=sys.stderr)
+                continue
+            seen.add(real)
+            paths.append(path)
+    if len(paths) < 2:
+        raise SystemExit(f"error: at least two input files are required, found {len(paths)}")
+    if expanded:
+        print("inputs, in merge order:", file=sys.stderr)
+        for n, path in enumerate(paths, start=1):
+            print(f"  {n}. {path}", file=sys.stderr)
+    args.input = paths
 
 
 def parse_args(argv):
@@ -966,7 +1012,8 @@ def parse_args(argv):
         epilog=HELP_EPILOG,
     )
     p.add_argument("-i", "--input", nargs="+", required=True, metavar="FILE",
-                   help="input KDBX files (at least 2), in priority order")
+                   help="input KDBX files (at least 2), in priority order; wildcards "
+                        "(*, ?, [abc], **) are allowed, matches are used in sorted order")
     p.add_argument("-ip", "--input-password", choices=["user", "secret-tool"],
                    default="user", metavar="{user,secret-tool}",
                    help="how input passwords are obtained (default: user, see below)")
@@ -983,8 +1030,6 @@ def parse_args(argv):
     p.add_argument("-v", "--verbose", action="store_true",
                    help="list renamed duplicate entries")
     args = p.parse_args(argv)
-    if len(args.input) < 2:
-        p.error("at least two input files are required")
     return args
 
 
@@ -992,10 +1037,7 @@ def main(argv=None):
     harden_process()
     os.umask(0o077)
     args = parse_args(sys.argv[1:] if argv is None else argv)
-
-    for path in args.input:
-        if not os.path.isfile(path):
-            raise SystemExit(f"error: input file not found: {path}")
+    expand_inputs(args)
     if os.path.exists(args.output):
         if any(os.path.samefile(args.output, p) for p in args.input):
             raise SystemExit("error: output file is one of the input files")

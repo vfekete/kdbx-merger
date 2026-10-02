@@ -40,7 +40,7 @@ any password. The folder structure is kept, and nothing is ever overwritten.
 
 | Option | Meaning |
 | --- | --- |
-| `-i FILE FILE …` | Input files, at least two, in priority order |
+| `-i FILE FILE …` | Input files, at least two, in priority order. Wildcards are allowed (see below). |
 | `-ip user` | Type input passwords (default). A password that worked is tried on the following files first, so a shared password is typed only once. |
 | `-ip secret-tool` | Read input passwords from the system keyring (see below) |
 | `-o FILE` | Output file. It must not exist yet. |
@@ -51,6 +51,21 @@ any password. The folder structure is kept, and nothing is ever overwritten.
 | `-v` | List renamed duplicates and combined folders |
 
 Run `./merge-kdbx --help` for the full description.
+
+### Wildcards
+
+```bash
+./merge-kdbx -i main.kdbx 'flower*.kdbx' -o merged.kdbx
+```
+
+`flower*.kdbx` uses every file starting with `flower` and ending with `.kdbx`. `*`, `?`,
+`[abc]` and `**` (any subfolder) work, quoted or unquoted.
+
+- **Order:** a pattern's matches are merged at the pattern's place on the command line.
+  Quoted patterns are sorted by name. Unquoted patterns are expanded by your shell, so its
+  ordering applies. The script prints the final merge order.
+- **Repeats:** a file matched or listed more than once is used only once.
+- **Output file:** the output is never used as an input, even if it matches the pattern.
 
 ### Input passwords from secret-tool
 
