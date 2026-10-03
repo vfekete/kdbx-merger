@@ -50,6 +50,7 @@ import tempfile
 import traceback
 import unicodedata
 import uuid
+from datetime import datetime, timezone
 
 from lxml import etree
 from pykeepass import PyKeePass
@@ -628,6 +629,43 @@ def _lookalike_reason(a, b):
     return "differs only in case, spaces or character encoding"
 
 
+STANDARD_FIELDS = ("UserName", "URL", "Notes")
+_ALL_STANDARD = ("Title", "UserName", "Password", "URL", "Notes")
+
+
+def _field_text(entry_el, key):
+    value = _string_field(entry_el, key)
+    return (value.text or "") if value is not None else ""
+
+
+def _custom_fields(entry_el):
+    """{key: (value, protected)} of the entry's non-standard string fields."""
+    fields = {}
+    for s in entry_el.findall("String"):
+        key = s.findtext("Key")
+        if key in _ALL_STANDARD:
+            continue
+        value = s.find("Value")
+        fields[key] = ((value.text or "") if value is not None else "",
+                       value is not None and value.get("Protected") == "True")
+    return fields
+
+
+def _version_key(entry_el):
+    """Identity of a history version, independent of its entry UUID."""
+    return (entry_el.findtext("Times/LastModificationTime"),
+            tuple(sorted((s.findtext("Key") or "", s.findtext("Value") or "")
+                         for s in entry_el.findall("String"))),
+            tuple(sorted((b.findtext("Key") or "", b.find("Value").get("Ref") or "")
+                         for b in entry_el.findall("Binary") if b.find("Value") is not None)))
+
+
+def _note_value(name, value):
+    if not value:
+        return f"  {name}: (empty)"
+    return f"  {name}: " + value.replace("\n", "\n    ")
+
+
 def _new_uuid():
     return base64.b64encode(uuid.uuid4().bytes).decode()
 
@@ -659,8 +697,11 @@ class Merger:
         self.binary_users = {}
         for e in root.xpath("//Entry[not(parent::History)]"):
             self._track_attachments(e, first_label)
+        # entry element -> its Title / Notes before this script changed them
+        self.original = {}
         self.stats = dict(groups_created=0, groups_reused=0, groups_joined=0, lookalikes=0,
-                          entries_copied=0, entries_renamed=0, attachment_notes=0)
+                          entries_copied=0, entries_renamed=0, entries_same=0,
+                          attachment_notes=0)
         self._join_same_named_groups(self.out_root_group, first_label, [])
 
     # -- helpers --------------------------------------------------------------
@@ -830,13 +871,33 @@ class Merger:
         for ref in entry.xpath(".//Binary/Value[@Ref]"):
             ref.set("Ref", str(self._binary_id(int(ref.get("Ref")))))
         self._fix_icons(entry)
-        self._place_entry(entry, out_group, self.source_label, path)
-        self._track_attachments(entry, self.source_label)
-        self.stats["entries_copied"] += 1
+        if self._place_entry(entry, out_group, self.source_label, path):
+            self._track_attachments(entry, self.source_label)
+            self.stats["entries_copied"] += 1
+
+    def _snapshot(self, entry):
+        if entry not in self.original:
+            notes = _string_field(entry, "Notes")
+            self.original[entry] = {
+                "Title": _title(entry),
+                "Notes": (notes.text or "") if notes is not None else "",
+            }
+        return self.original[entry]
 
     def _place_entry(self, entry, out_group, label, path):
-        """Put entry into out_group, indexing its title if already taken."""
+        """Put entry into out_group, indexing its title if already taken.
+        An item with the same title and password as one already in the
+        folder is not added; the existing item records it instead.
+        Returns False when the entry was absorbed that way."""
         title = _title(entry)
+        password = _field_text(entry, "Password")
+        for other in out_group.findall("Entry"):
+            if (self._snapshot(other)["Title"] == title
+                    and _field_text(other, "Password") == password):
+                self._absorb_same_entry(other, entry, label, path)
+                return False
+
+        self._snapshot(entry)
         existing = {_title(e) for e in out_group.findall("Entry")}
         if title not in existing:
             self._warn_lookalike("item", title, existing, path)
@@ -855,6 +916,104 @@ class Merger:
             first_group.addprevious(entry)
         else:
             out_group.append(entry)
+        return True
+
+    def _absorb_same_entry(self, kept, dropped, label, path):
+        """Record in `kept` that `dropped` (same title + password) exists in
+        another file, together with everything that differs. Nothing is lost:
+        visible differences go to Notes, protected fields, attachments and
+        older versions (history) are moved to `kept`."""
+        original = self._snapshot(kept)
+        lines = []
+
+        for key in STANDARD_FIELDS:
+            mine = original["Notes"] if key == "Notes" else _field_text(kept, key)
+            theirs = _field_text(dropped, key)
+            if theirs != mine:
+                lines.append(_note_value(key, theirs))
+        kept_tags, dropped_tags = kept.findtext("Tags") or "", dropped.findtext("Tags") or ""
+        if dropped_tags != kept_tags:
+            lines.append(_note_value("Tags", dropped_tags))
+        if self._expiry(dropped) != self._expiry(kept):
+            lines.append(f"  Expires: {self._expiry(dropped)}")
+
+        kept_fields = _custom_fields(kept)
+        for key, (value, protected) in _custom_fields(dropped).items():
+            if key in kept_fields and kept_fields[key][0] == value:
+                continue
+            if not protected:
+                lines.append(_note_value(f'field "{key}"', value))
+                continue
+            new_key, n = f"{key} ({label})", 1
+            while new_key in kept_fields:
+                n += 1
+                new_key = f"{key} ({label}, {n})"
+            _set_string(kept, new_key, value)
+            kept.xpath("String[Key=$k]/Value", k=new_key)[0].set("Protected", "True")
+            kept_fields[new_key] = (value, True)
+            lines.append(f'  protected field "{key}" differs, saved as field "{new_key}"')
+
+        kept_binaries = {b.find("Value").get("Ref") for b in kept.findall("Binary")
+                         if b.find("Value") is not None}
+        kept_names = {b.findtext("Key") for b in kept.findall("Binary")}
+        for b in dropped.findall("Binary"):
+            ref = b.find("Value")
+            if ref is None or ref.get("Ref") in kept_binaries:
+                continue
+            name = b.findtext("Key") or ""
+            new_name = name if name not in kept_names else f"{name} ({label})"
+            b.find("Key").text = new_name
+            anchor = next((kept.find(t) for t in ("AutoType", "History")
+                           if kept.find(t) is not None), None)
+            if anchor is not None:
+                anchor.addprevious(b)
+            else:
+                kept.append(b)
+            kept_binaries.add(ref.get("Ref"))
+            kept_names.add(new_name)
+            bid = int(ref.get("Ref"))
+            self.binary_files.setdefault(bid, {})[label] = None
+            self.binary_users.setdefault(bid, []).append((kept, new_name))
+            lines.append(f'  attachment "{name}" added' +
+                         (f' as "{new_name}"' if new_name != name else ""))
+
+        history = kept.find("History")
+        known = {_version_key(v) for v in history.findall("Entry")} if history is not None \
+            else set()
+        older = [v for v in dropped.findall("History/Entry") if _version_key(v) not in known]
+        if older:
+            if history is None:
+                history = etree.SubElement(kept, "History")
+            kept_uuid = kept.findtext("UUID")
+            for version in older:
+                version.find("UUID").text = kept_uuid
+                history.append(version)
+            versions = sorted(history.findall("Entry"), key=self._modified)
+            for version in versions:
+                history.append(version)          # re-append in time order
+            lines.append(f"  {len(older)} older version(s) added to history")
+
+        header = f"also in: {label}" + (", with differences:" if lines else "")
+        _append_note(kept, "\n".join([header] + lines))
+        self.stats["entries_same"] += 1
+        if self.verbose:
+            print(f"  same item: {'/'.join(path + [_title(dropped)])} also in {label}",
+                  file=sys.stderr)
+
+    def _expiry(self, entry):
+        times = entry.find("Times")
+        if times is None or (times.findtext("Expires") or "").lower() != "true":
+            return "never"
+        text = times.findtext("ExpiryTime")
+        return str(self.out._decode_time(text)) if text else "never"
+
+    def _modified(self, entry):
+        text = entry.findtext("Times/LastModificationTime")
+        try:
+            return self.out._decode_time(text) if text else datetime.min.replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
 
     def finish(self):
         """Note on every entry whose attachment was found in several input
@@ -941,10 +1100,16 @@ output password (-p / -ps / prompt):
   (neither)     typed twice at the prompt
 
 duplicates:
-  An entry whose title already exists in the same folder is added as
-  "title - N" (N = highest existing index + 1) with "source: <file>" appended
-  to its notes. Identical attachments are stored once; entries carrying them
-  get a note listing every input file in which the attachment was found.
+  An entry with the same title AND password as an entry in the same folder is
+  the same item: it is not added again. The existing entry gets an
+  "also in: <file>" note listing visible differences (user name, URL, notes,
+  tags, expiry, unprotected fields); differing protected fields, different
+  attachments and older versions (history) are moved to the existing entry.
+  An entry whose title already exists in the same folder with another
+  password is added as "title - N" (N = highest existing index + 1) with
+  "source: <file>" appended to its notes. Identical attachments are stored
+  once; entries carrying them get a note listing every input file in which
+  the attachment was found.
   Folders are never duplicated: folders with the same path are one folder,
   also when a single input file contains same-named sibling folders.
   Names must be truly identical to match. Names that only look alike
@@ -1078,6 +1243,7 @@ def main(argv=None):
         s = merger.stats
         print(f"written  {args.output}: {s['entries_copied']} entries merged "
               f"({s['entries_renamed']} renamed as duplicates), "
+              f"{s['entries_same']} same items noted instead of copied, "
               f"{s['groups_created']} groups created, "
               f"{s['groups_joined']} same-named groups joined", file=sys.stderr)
     finally:
